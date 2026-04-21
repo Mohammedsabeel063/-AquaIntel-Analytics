@@ -13,6 +13,8 @@ from utils.data_loader import (
     CORE_FEATURES, BIS_STANDARDS
 )
 
+from utils.model_utils import SoftVotingHybrid
+
 # ─── Page config ─────────────────────────────────────────────
 # sets layout + theme
 st.set_page_config(
@@ -280,6 +282,11 @@ with tab5:
         if st.button("Predict"):
             input_df = pd.DataFrame([inputs])
             
+            # Initialize prediction variables
+            rf_pred = None
+            xgb_pred = None
+            hybrid_pred = None
+            
             col1, col2, col3 = st.columns(3)
             
             # RF Full (Main)
@@ -316,9 +323,9 @@ with tab5:
             pred_summary = {
                 "RF (Main)": "Safe" if rf_pred == 1 else "Unsafe",
             }
-            if "xgb_full" in models:
+            if xgb_pred is not None:
                 pred_summary["XGB"] = "Safe" if xgb_pred == 1 else "Unsafe"
-            if "hybrid_soft" in models:
+            if hybrid_pred is not None:
                 pred_summary["Soft Hybrid"] = "Safe" if hybrid_pred == 1 else "Unsafe"
             
             summary_df = pd.DataFrame(list(pred_summary.items()), columns=["Model", "Prediction"])
