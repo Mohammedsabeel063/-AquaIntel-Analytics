@@ -351,3 +351,4 @@ with tab6:
 
         fig = px.histogram(new_df, x="WQI")
         st.plotly_chart(fig, use_container_width=True)
+        //removed lite models
