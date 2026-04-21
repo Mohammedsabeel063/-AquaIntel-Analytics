@@ -8,14 +8,27 @@ __pycache__/
 
 # ─── Models ──────────────────────────────────────────
 models/*.pkl
-
-# ─── Data (optional, if large) ───────────────────────
-data/*.csv
-data/*.parquet
+# But keep these specific trained models
+!models/rf_full.pkl
+!models/xgb_full.pkl
+!models/hybrid_soft.pkl
 
 # ─── Generated Outputs ───────────────────────────────
+# Ignore all figures and PNGs by default
 figures/
 *.png
+# But keep these specific important figures
+!figures/cm_rf_full.png
+!figures/cm_xgb_full.png
+!figures/cm_hybrid_soft.png
+!figures/fi_rf_full.png
+!figures/lc_rf_full.png
+!figures/model_comparison.csv
+!figures/cm_xgb_full.png
+!figures/cm_hybrid_soft.png
+!figures/fi_rf_full.png
+!figures/lc_rf_full.png
+!figures/model_comparison.csv
 
 # ─── Streamlit Cache ─────────────────────────────────
 .streamlit/
