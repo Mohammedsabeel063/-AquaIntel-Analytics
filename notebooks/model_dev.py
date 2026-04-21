@@ -297,3 +297,5 @@ print(summary.to_string(index=False))
 summary.to_csv(f"{FIGURES_DIR}/model_comparison.csv", index=False)
 print("\n✅  model_comparison.csv saved")
 print("✅  Model development complete.")
+# Model update: RF (main), XGBoost, and RF+XGB hybrid added; Lite model removed
+
