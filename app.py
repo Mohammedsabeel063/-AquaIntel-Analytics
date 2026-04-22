@@ -46,7 +46,12 @@ def load_data():
     try:
         raw = load_all_csvs(data_dir)
         source = "real"
-    except:
+    except FileNotFoundError:
+        st.warning("No data files found. Generating synthetic data...")
+        raw = generate_synthetic_cwc(n=8000)
+        source = "synthetic"
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}. Using synthetic data instead.")
         raw = generate_synthetic_cwc(n=8000)
         source = "synthetic"
     return preprocess(raw), source
@@ -60,7 +65,10 @@ def load_models():
     for f in ["rf_full.pkl", "xgb_full.pkl", "hybrid_soft.pkl"]:
         path = os.path.join(model_dir, f)
         if os.path.exists(path):
-            models[f.replace(".pkl", "")] = joblib.load(path)
+            try:
+                models[f.replace(".pkl", "")] = joblib.load(path)
+            except Exception as e:
+                st.warning(f"Could not load model {f}: {str(e)}")
     return models
 
 
@@ -71,32 +79,46 @@ models = load_models()
 # user filters
 st.sidebar.title("Filters")
 
+# Initialize session state for filters
+if "sel_states" not in st.session_state:
+    st.session_state.sel_states = None
+if "sel_years" not in st.session_state:
+    st.session_state.sel_years = None
+if "wqi_range" not in st.session_state:
+    st.session_state.wqi_range = (0.0, 100.0)
+
 states = sorted(df["state"].dropna().unique())
-sel_states = st.sidebar.multiselect("States", states, default=states)
+sel_states = st.sidebar.multiselect("States", states, default=states, key="state_filter")
 
 if "year" in df.columns:
     yr_min, yr_max = int(df["year"].min()), int(df["year"].max())
-    sel_years = st.sidebar.slider("Year", yr_min, yr_max, (yr_min, yr_max))
+    sel_years = st.sidebar.slider("Year", yr_min, yr_max, (yr_min, yr_max), key="year_filter")
 else:
     sel_years = None
 
-wqi_range = st.sidebar.slider("WQI", 0.0, 100.0, (0.0, 100.0))
+wqi_range = st.sidebar.slider("WQI", 0.0, 100.0, (0.0, 100.0), key="wqi_filter")
 
 
 # ─── Filtering ───────────────────────────────────────────────
 # applies filters to dataset
-filt = df.copy()
+@st.cache_data
+def apply_filters(df, sel_states, sel_years, wqi_range):
+    filt = df.copy()
+    
+    if sel_states:
+        filt = filt[filt["state"].isin(sel_states)]
+    
+    if sel_years and "year" in filt.columns:
+        filt = filt[(filt["year"] >= sel_years[0]) & (filt["year"] <= sel_years[1])]
+    
+    filt = filt[(filt["WQI"] >= wqi_range[0]) & (filt["WQI"] <= wqi_range[1])]
+    
+    # clean labels (prevents bugs)
+    filt["water_quality"] = filt["water_quality"].astype(str).str.strip()
+    
+    return filt
 
-if sel_states:
-    filt = filt[filt["state"].isin(sel_states)]
-
-if sel_years and "year" in filt.columns:
-    filt = filt[(filt["year"] >= sel_years[0]) & (filt["year"] <= sel_years[1])]
-
-filt = filt[(filt["WQI"] >= wqi_range[0]) & (filt["WQI"] <= wqi_range[1])]
-
-# clean labels (prevents bugs)
-filt["water_quality"] = filt["water_quality"].astype(str).str.strip()
+filt = apply_filters(df, sel_states, sel_years, wqi_range)
 
 # downsample for performance
 plot_df = filt.sample(min(3000, len(filt)), random_state=42)
@@ -132,17 +154,18 @@ with tab1:
     st.markdown("### Distribution")
 
     # pie chart
-    wq_counts = filt["water_quality"].value_counts().reset_index()
-    wq_counts.columns = ["Category", "Count"]
+    with st.spinner("Generating distribution chart..."):
+        wq_counts = filt["water_quality"].value_counts().reset_index()
+        wq_counts.columns = ["Category", "Count"]
 
-    fig = px.pie(
-        wq_counts,
-        names="Category",
-        values="Count",
-        color="Category",
-        color_discrete_map=get_valid_colors(wq_counts, "Category", QUAL_COLORS)
-    )
-    st.plotly_chart(fig, use_container_width=True)
+        fig = px.pie(
+            wq_counts,
+            names="Category",
+            values="Count",
+            color="Category",
+            color_discrete_map=get_valid_colors(wq_counts, "Category", QUAL_COLORS)
+        )
+        st.plotly_chart(fig, width='stretch')
     # ─ River Analysis ─
 
 st.markdown("### 🌊 River Water Quality Analysis")
@@ -166,7 +189,7 @@ if "River" in filt.columns:
             lambda x: "High Risk" if x > 70 else "Moderate" if x > 50 else "Low Risk"
         )
 
-        st.dataframe(river_summary.head(10), use_container_width=True)
+        st.dataframe(river_summary.head(10))
 
         fig = px.bar(
             river_summary.head(10),
@@ -178,7 +201,7 @@ if "River" in filt.columns:
             title="Top Polluted Rivers"
         )
 
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
     else:
         st.info("No river data after filtering.")
@@ -189,77 +212,251 @@ else:
     # histogram
     fig = px.histogram(plot_df, x="WQI", nbins=40)
     fig.add_vline(x=50, line_dash="dash", line_color="red")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 ## ─── Heatmap ─────────────────────────────────────────────
 with tab2:
 
-    st.markdown("### Risk Heatmap")
+    st.markdown("### Water Quality Spatial Analysis")
 
     if "latitude" in filt.columns:
 
-        map_df = filt.dropna(subset=["latitude", "longitude", "WQI", "water_quality"])
-
-        if len(map_df) == 0:
-            st.warning("No valid coordinates after filtering")
-        else:
-            # separate samples for smoother rendering
-            density_df = map_df.sample(min(3000, len(map_df)), random_state=42)
-            scatter_df = map_df.sample(min(1500, len(map_df)), random_state=42)
-
-            # ─── Density Map (softer colors)
-            fig = px.density_mapbox(
-                density_df,
-                lat="latitude",
-                lon="longitude",
-                z="WQI",
-                radius=18,
-                center={"lat": 20.5, "lon": 80},
-                zoom=4,
-                mapbox_style="carto-positron",
-                color_continuous_scale=[
-                    [0.0, "#e3f2fd"],
-                    [0.3, "#90caf9"],
-                    [0.6, "#42a5f5"],
-                    [1.0, "#1e88e5"]
-                ]
-            )
-
-            fig.update_layout(height=550)
-            st.plotly_chart(fig, use_container_width=True)
-
-            # spacing so charts don’t visually overlap
-            st.markdown("---")
-
-            # ─── Scatter Map (stations clearly visible)
-            st.markdown("### Stations")
-
-            color_map = get_valid_colors(scatter_df, "water_quality", QUAL_COLORS)
-
-            fig2 = px.scatter_mapbox(
-                scatter_df,
-                lat="latitude",
-                lon="longitude",
-                color="water_quality",
-                color_discrete_map=color_map,
-                size="WQI",
-                size_max=12,
-                center={"lat": 20.5, "lon": 80},
-                zoom=4,
-                mapbox_style="open-street-map",
-            )
-
-            # improve marker visibility
-            fig2.update_traces(
-                marker=dict(
-                    opacity=0.9
+        # Map configuration - merged controls
+        with st.expander("Map Configuration", expanded=True):
+            col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
+            
+            with col1:
+                basemap_style = st.selectbox(
+                    "Basemap",
+                    ["OpenStreetMap", "Carto Positron", "Carto Dark"],
+                    index=0,
+                    key="basemap_selector"
                 )
-            )
+            
+            with col2:
+                color_theme = st.selectbox(
+                    "Color Theme",
+                    ["Green-Yellow-Red", "Blue-Purple-Red", "Viridis", "Plasma", "Inferno"],
+                    index=0,
+                    key="color_theme_selector"
+                )
+            
+            with col3:
+                color_mode = st.selectbox(
+                    "Station Color",
+                    ["Safe/Unsafe", "WQI Gradient", "Quality Categories"],
+                    index=0,
+                    key="color_mode_selector"
+                )
+            
+            with col4:
+                show_density = st.checkbox(
+                    "Show Density",
+                    value=True,
+                    key="density_toggle"
+                )
+            
+            st.markdown("")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                density_radius = st.slider("Density Radius", 5, 30, 18, key="density_radius")
+            
+            with col2:
+                marker_size = st.slider("Marker Size", 5, 25, 15, key="marker_size")
+            
+            with col3:
+                enable_animation = st.checkbox("Enable Time Animation", value=True, key="animation_toggle")
+        
+        # Color theme mapping
+        color_themes = {
+            "Green-Yellow-Red": [[0.0, "#27ae60"], [0.5, "#f1c40f"], [1.0, "#e74c3c"]],
+            "Blue-Purple-Red": [[0.0, "#3498db"], [0.5, "#9b59b6"], [1.0, "#e74c3c"]],
+            "Viridis": [[0.0, "#440154"], [0.5, "#21918c"], [1.0, "#fde725"]],
+            "Plasma": [[0.0, "#0d0887"], [0.5, "#cc4778"], [1.0, "#f0f921"]],
+            "Inferno": [[0.0, "#000004"], [0.5, "#b53679"], [1.0, "#fcffa4"]]
+        }
+        selected_colors = color_themes[color_theme]
+        
+        # Map style mapping
+        basemap_map = {
+            "OpenStreetMap": "open-street-map",
+            "Carto Positron": "carto-positron",
+            "Carto Dark": "carto-darkmatter"
+        }
+        selected_basemap = basemap_map[basemap_style]
 
-            fig2.update_layout(height=520)
+        with st.spinner("Loading spatial data..."):
+            map_df = filt.dropna(subset=["latitude", "longitude", "WQI", "water_quality"])
 
-            st.plotly_chart(fig2, use_container_width=True)
+            if len(map_df) == 0:
+                st.warning("No valid coordinates found")
+            else:
+                # Custom animation control using Streamlit slider
+                if enable_animation and "year" in map_df.columns:
+                    available_years = sorted(map_df["year"].unique())
+                    selected_year = st.selectbox("Select Year", available_years, index=len(available_years)-1, key="year_selector")
+                    map_df = map_df[map_df["year"] == selected_year]
+                    st.info(f"Showing data for year: {selected_year}")
+                
+                density_df = map_df.sample(min(2000, len(map_df)), random_state=42)
+                scatter_df = map_df.sample(min(1000, len(map_df)), random_state=42)
+
+                # Density Map with enhanced styling
+                if show_density:
+                    with st.spinner("Generating density heatmap..."):
+                        fig = px.density_mapbox(
+                            density_df,
+                            lat="latitude",
+                            lon="longitude",
+                            z="WQI",
+                            radius=density_radius,
+                            center={"lat": 20.5, "lon": 80},
+                            zoom=4,
+                            mapbox_style="carto-positron",
+                            color_continuous_scale=selected_colors,
+                            title="Water Quality Density Heatmap",
+                            labels={"z": "WQI Index"},
+                            range_color=[density_df["WQI"].min(), density_df["WQI"].max()],
+                            opacity=0.8
+                        )
+                        fig.update_layout(
+                            height=500, 
+                            margin=dict(l=0, r=0, t=30, b=0),
+                            coloraxis_colorbar=dict(title="WQI", x=1.02, len=0.8)
+                        )
+                        fig.update_traces(opacity=0.9)
+                        st.plotly_chart(fig, width='stretch', config={'scrollZoom': True, 'displayModeBar': True, 'displaylogo': False})
+
+                st.markdown("")
+
+                # Scatter Map with enhanced features
+                if color_mode == "Safe/Unsafe":
+                    scatter_df["status"] = scatter_df["is_safe"].map({1: "Safe", 0: "Unsafe"})
+                    color_column = "status"
+                    status_colors = {"Safe": "#27ae60", "Unsafe": "#e74c3c"}
+                    color_discrete_map = status_colors
+                elif color_mode == "WQI Gradient":
+                    color_column = "WQI"
+                    color_discrete_map = None
+                    status_colors = None
+                else:
+                    color_column = "water_quality"
+                    color_discrete_map = get_valid_colors(scatter_df, "water_quality", QUAL_COLORS)
+                    status_colors = None
+
+                with st.spinner("Rendering station map..."):
+                    if color_mode == "WQI Gradient":
+                        fig2 = px.scatter_mapbox(
+                            scatter_df,
+                            lat="latitude",
+                            lon="longitude",
+                            color="WQI",
+                            size="WQI",
+                            size_max=marker_size,
+                            center={"lat": 20.5, "lon": 80},
+                            zoom=4,
+                            mapbox_style=selected_basemap,
+                            title="Water Quality Monitoring Network",
+                            color_continuous_scale=selected_colors,
+                            hover_data={"WQI": ":.2f", "water_quality": True, "state": True}
+                        )
+                    else:
+                        fig2 = px.scatter_mapbox(
+                            scatter_df,
+                            lat="latitude",
+                            lon="longitude",
+                            color=color_column,
+                            color_discrete_map=color_discrete_map,
+                            size="WQI",
+                            size_max=marker_size,
+                            center={"lat": 20.5, "lon": 80},
+                            zoom=4,
+                            mapbox_style=selected_basemap,
+                            title="Water Quality Monitoring Network",
+                            hover_data={"WQI": ":.2f", "water_quality": True, "state": True}
+                        )
+
+                    fig2.update_traces(marker=dict(opacity=0.85), selector=dict(mode='markers'))
+                    fig2.update_layout(
+                        height=500,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        margin=dict(l=0, r=0, t=30, b=0)
+                    )
+                    st.plotly_chart(fig2, width='stretch', config={'scrollZoom': True, 'displayModeBar': True, 'displaylogo': False})
+
+                # Enhanced statistics with visual indicators
+                st.markdown("---")
+                st.markdown("### Spatial Analytics Dashboard")
+                
+                col1, col2, col3, col4 = st.columns(4)
+                safe_pct = (len(map_df[map_df["is_safe"] == 1]) / len(map_df)) * 100
+                
+                col1.metric("Total Stations", len(map_df), delta=f"{len(map_df)} locations")
+                col2.metric("Safe Stations", len(map_df[map_df["is_safe"] == 1]), delta=f"{safe_pct:.1f}%")
+                col3.metric("Unsafe Stations", len(map_df[map_df["is_safe"] == 0]), delta=f"{100-safe_pct:.1f}%")
+                col4.metric("Mean WQI", round(map_df["WQI"].mean(), 2), delta=f"Range: {map_df['WQI'].min():.1f}-{map_df['WQI'].max():.1f}")
+
+                # Export with options
+                st.markdown("---")
+                col1, col2 = st.columns(2)
+                
+                csv_data = map_df.to_csv(index=False)
+                col1.download_button(
+                    "Download Dataset (CSV)",
+                    data=csv_data,
+                    file_name=f"water_quality_spatial_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv",
+                    key="export_csv"
+                )
+                
+                col2.markdown(f"**Data Summary:** {len(map_df)} stations across {map_df['state'].nunique()} states")
+
+                # Advanced geospatial analysis
+                st.markdown("---")
+                st.markdown("### Risk Assessment")
+                
+                if len(map_df) > 10:
+                    with st.spinner("Performing spatial analysis..."):
+                        unsafe_df = map_df[map_df["is_safe"] == 0]
+                        
+                        if len(unsafe_df) > 0:
+                            tab_a, tab_b = st.tabs(["High-Risk Areas", "Quality Distribution"])
+                            
+                            with tab_a:
+                                st.markdown("#### States with Most Unsafe Stations")
+                                state_risk = unsafe_df.groupby("state").agg(
+                                    unsafe_count=("is_safe", "count"),
+                                    avg_wqi=("WQI", "mean"),
+                                    max_wqi=("WQI", "max"),
+                                    total_stations=("state", "count")
+                                ).sort_values("unsafe_count", ascending=False).head(10)
+                                state_risk.columns = ["Unsafe Count", "Avg WQI", "Max WQI", "Total Stations"]
+                                st.dataframe(state_risk, width='stretch')
+                                
+                                # Risk level visualization
+                                st.markdown("#### Risk Level Heatmap")
+                                risk_heatmap = state_risk[["Unsafe Count", "Avg WQI"]]
+                                st.dataframe(risk_heatmap, width='stretch')
+                            
+                            with tab_b:
+                                st.markdown("#### Water Quality Distribution")
+                                risk_levels = map_df["water_quality"].value_counts()
+                                
+                                fig_dist = px.pie(
+                                    values=risk_levels.values,
+                                    names=risk_levels.index,
+                                    title="Quality Category Distribution",
+                                    hole=0.4
+                                )
+                                fig_dist.update_traces(textposition='inside', textinfo='percent+label')
+                                fig_dist.update_layout(height=400)
+                                st.plotly_chart(fig_dist, width='stretch', config={'displayModeBar': True, 'displaylogo': False})
+                        else:
+                            st.success("✅ All stations meet safety standards in current view")
+                else:
+                    st.warning("⚠️ Insufficient data for comprehensive analysis")
 
 # ─── Trends ─────────────────────────────────────────────
 with tab3:
@@ -269,14 +466,44 @@ with tab3:
     if "year" not in filt.columns:
         st.warning("No year column in dataset")
     else:
-        trend = filt.groupby("year")["WQI"].mean().reset_index()
+        with st.spinner("Generating trend analysis..."):
+            trend = filt.groupby("year")["WQI"].mean().reset_index()
 
-        if len(trend) == 0:
-            st.warning("No data after filtering")
-        else:
-            fig = px.line(trend, x="year", y="WQI", markers=True)
-            fig.update_layout(height=400)
-            st.plotly_chart(fig, use_container_width=True)
+            if len(trend) == 0:
+                st.warning("No data after filtering")
+            else:
+                # Animation toggle
+                show_animation = st.checkbox("Show Animation", value=False, key="trend_animation")
+                
+                if show_animation and len(trend) > 2:
+                    fig = px.line(
+                        trend, 
+                        x="year", 
+                        y="WQI", 
+                        markers=True,
+                        animation_frame="year",
+                        range_y=[trend["WQI"].min() - 5, trend["WQI"].max() + 5]
+                    )
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, width='stretch')
+                else:
+                    fig = px.line(trend, x="year", y="WQI", markers=True)
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, width='stretch')
+                
+                # Trend statistics
+                st.markdown("### 📈 Trend Statistics")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Years Analyzed", len(trend))
+                col2.metric("Avg WQI", round(trend["WQI"].mean(), 2))
+                
+                # Calculate trend direction
+                if len(trend) >= 2:
+                    first_year = trend.iloc[0]["WQI"]
+                    last_year = trend.iloc[-1]["WQI"]
+                    trend_change = last_year - first_year
+                    trend_direction = "Improving ↓" if trend_change < 0 else "Deteriorating ↑"
+                    col3.metric("Trend", trend_direction)
 # ════════════════════════════════════════════════════════════
 # TAB 4 — ANALYSIS
 # ════════════════════════════════════════════════════════════
@@ -289,17 +516,18 @@ with tab4:
         param_a = st.selectbox("Parameter A", avail)
         param_b = st.selectbox("Parameter B", avail, index=1)
 
-        scatter_df = filt[[param_a, param_b, "water_quality"]].dropna()
-        scatter_df = scatter_df.sample(min(2000, len(scatter_df)))
+        with st.spinner("Generating scatter plot..."):
+            scatter_df = filt[[param_a, param_b, "water_quality"]].dropna()
+            scatter_df = scatter_df.sample(min(1500, len(scatter_df)))
 
-        fig = px.scatter(
-            scatter_df,
-            x=param_a,
-            y=param_b,
-            color="water_quality",
-            color_discrete_map=get_valid_colors(scatter_df, "water_quality", QUAL_COLORS)
-        )
-        st.plotly_chart(fig, use_container_width=True)
+            fig = px.scatter(
+                scatter_df,
+                x=param_a,
+                y=param_b,
+                color="water_quality",
+                color_discrete_map=get_valid_colors(scatter_df, "water_quality", QUAL_COLORS)
+            )
+            st.plotly_chart(fig, width='stretch')
 
 
 # ════════════════════════════════════════════════════════════
@@ -372,7 +600,7 @@ with tab5:
                 pred_summary["Soft Hybrid"] = "Safe" if hybrid_pred == 1 else "Unsafe"
             
             summary_df = pd.DataFrame(list(pred_summary.items()), columns=["Model", "Prediction"])
-            st.dataframe(summary_df, use_container_width=True)
+            st.dataframe(summary_df)
 
     else:
         st.warning("Run model_dev.py first")
@@ -387,10 +615,11 @@ with tab6:
 
     if uploaded:
 
-        new_df = pd.read_csv(uploaded)
+        with st.spinner("Processing uploaded file..."):
+            new_df = pd.read_csv(uploaded)
 
-        st.write(new_df.head())
+            st.write(new_df.head())
 
-        fig = px.histogram(new_df, x="WQI")
-        st.plotly_chart(fig, use_container_width=True)
-        //removed lite models
+            fig = px.histogram(new_df, x="WQI")
+            st.plotly_chart(fig, width='stretch')
+        
